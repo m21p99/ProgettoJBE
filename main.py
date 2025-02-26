@@ -1,4 +1,4 @@
-import numpy as np
+#import numpy as np
 import struct, os
 from collections import Counter, namedtuple
 from decimal import getcontext, Decimal

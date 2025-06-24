@@ -1,15 +1,17 @@
-import struct,os
+import struct, os, time, gc, sys, ctypes
 from collections import Counter, namedtuple
-from decimal import Decimal,getcontext
+from decimal import getcontext, Decimal
 from fractions import Fraction
 import multiprocessing
-getcontext().prec = 100
 
-EncodedData1 = namedtuple("EncodedData", ["encoded_value", "ranges","length"])
+# Utilizziamo EncodedData per ciascun blocco
+EncodedData = namedtuple("EncodedData", ["encoded_value", "total_bits", "total", "ranges", "length"])
 
+# ============================
+# FUNZIONI DI RUN-LENGTH
+# ============================
 def run_length_encoding(data):
     """Applica Run-Length Encoding (RLE) a una stringa."""
-    #print("\n[INFO] Eseguendo Run-Length Encoding (RLE)...")
     encoded = []
     i = 0
     while i < len(data):
@@ -18,461 +20,720 @@ def run_length_encoding(data):
             i += 1
             count += 1
         encoded.append((data[i], count))
-        #print(f"    - Carattere: {data[i]}, Conteggio: {count}")
         i += 1
     return encoded
+# Percorso completo della libreria compilata
+dll_path = os.path.join(r"C:\Users\mario\PycharmProjects\ProgettoJBE\libdivsufsort\build\examples\Release", "divsufsort.dll")
+
+# Carica la libreria
+divsufsort = ctypes.CDLL(dll_path)
+
 def run_length_decoding(encoded):
-    """Decodifica Run-Length Encoding (RLE) dalla stringa."""
+    """Decodifica una stringa codificata con RLE."""
     decoded = []
     i = 0
     while i < len(encoded):
-        char = encoded[i]  # Prende il carattere
+        char = encoded[i]
         i += 1
         count_str = ""
-        
-        # Accumula tutti i numeri successivi come conteggio
         while i < len(encoded) and encoded[i].isdigit():
             count_str += encoded[i]
             i += 1
-        
-        count = int(count_str) if count_str else 1  # Converte il numero in intero
-        
-        decoded.extend([char] * count)  # Ricostruisce la sequenza
+        count = int(count_str) if count_str else 1
+        decoded.extend([char] * count)
     return "".join(decoded)
 
+# ============================
+# FUNZIONI DI BURROWS-WHEELER (BWT) CON SA-IS
+# ============================
+def sais(s):
+    """
+    Implementazione dell'algoritmo SA-IS.
+    s: lista di interi (in cui l'elemento 0 è il carattere sentinella).
+    Restituisce il suffix array come lista di indici.
+    """
+    n = len(s)
+    if n == 0:
+        return []
+    if n == 1:
+        return [0]
 
-def parallel_bwt(text, block_size=1024):
-    """Applica BWT in parallelo su blocchi."""
-    blocks = [text[i:i+block_size] for i in range(0, len(text), block_size)]
-    
-    with multiprocessing.Pool() as pool:
-        results = pool.map(burrows_wheeler_transform, blocks)  # Esegue BWT in parallelo
-    
-    return "".join(results)  # Ricombina i blocchi trasformati
+    # Classificazione in tipi S e L
+    t = [False] * n  # True per S-type, False per L-type
+    t[-1] = True
+    for i in range(n - 2, -1, -1):
+        if s[i] < s[i + 1]:
+            t[i] = True
+        elif s[i] == s[i + 1]:
+            t[i] = t[i + 1]
 
-def burrows_wheeler_transform(text, block_size=1024):
-    """Applica BWT in blocchi per file di grandi dimensioni."""
-    #print("\n[INFO] Eseguendo Burrows-Wheeler Transform (BWT)...")
-    text += "$"
-    #print(f"[DEBUG] Testo con delimitatore: {text}")
-    
+    # Indici LMS (Left-most S-type)
+    lms = [i for i in range(1, n) if t[i] and not t[i - 1]]
+
+    # Calcolo delle dimensioni dei bucket per ciascun carattere
+    alphabet_size = max(s) + 1
+    bucket_sizes = [0] * alphabet_size
+    for ch in s:
+        bucket_sizes[ch] += 1
+
+    # Calcola gli estremi dei bucket
+    bucket_start = [0] * alphabet_size
+    bucket_end = [0] * alphabet_size
+    sum_ = 0
+    for i in range(alphabet_size):
+        bucket_start[i] = sum_
+        sum_ += bucket_sizes[i]
+        bucket_end[i] = sum_ - 1
+
+    def induce(lms_order):
+        SA = [-1] * n
+        # Passo 1: Posiziona gli indici LMS nei bucket (da destra)
+        b_end = bucket_end.copy()
+        for i in lms_order[::-1]:
+            ch = s[i]
+            SA[b_end[ch]] = i
+            b_end[ch] -= 1
+
+        # Passo 2: Induzione dei tipi L (da sinistra)
+        b_start = bucket_start.copy()
+        for i in range(n):
+            j = SA[i] - 1
+            if j >= 0 and not t[j]:
+                ch = s[j]
+                SA[b_start[ch]] = j
+                b_start[ch] += 1
+
+        # Passo 3: Induzione dei tipi S (da destra)
+        b_end = bucket_end.copy()
+        for i in range(n - 1, -1, -1):
+            j = SA[i] - 1
+            if j >= 0 and t[j]:
+                ch = s[j]
+                SA[b_end[ch]] = j
+                b_end[ch] -= 1
+        return SA
+
+    # Primo induzione: usa l'ordine naturale degli LMS
+    SA = induce(lms)
+
+    # Assegna nomi alle sottostringhe LMS
+    lms_names = [-1] * n
+    new_name = 0
+    prev = -1
+    # Estrae l'ordine dei LMS ordinati nel SA
+    lms_order = [i for i in SA if i in lms]
+    for i in lms_order:
+        if prev == -1:
+            lms_names[i] = new_name
+            prev = i
+        else:
+            diff = False
+            for d in range(n):
+                if i + d == n or prev + d == n:
+                    if i + d == n and prev + d == n:
+                        break
+                    else:
+                        diff = True
+                        break
+                if s[i + d] != s[prev + d] or t[i + d] != t[prev + d]:
+                    diff = True
+                    break
+                if d > 0 and ((i + d in lms) or (prev + d in lms)):
+                    break
+            if diff:
+                new_name += 1
+            lms_names[i] = new_name
+            prev = i
+
+    new_seq = [lms_names[i] for i in lms if lms_names[i] != -1]
+
+    if new_name + 1 == len(new_seq):
+        new_lms_order = [0] * len(lms)
+        for i, name in enumerate(new_seq):
+            new_lms_order[name] = lms[i]
+    else:
+        new_lms_order = sais(new_seq)
+        new_lms_order = [lms[i] for i in new_lms_order]
+
+    SA = induce(new_lms_order)
+    return SA
+
+def suffix_array_sa_is(text):
+    """
+    Costruisce il suffix array della stringa 'text' usando SA-IS.
+    La stringa viene convertita in una lista di interi e viene aggiunto un carattere sentinella (0).
+    Restituisce il suffix array (senza l'indice del sentinella).
+    """
+    s = [ord(c) for c in text]
+    s.append(0)  # carattere sentinella
+    SA = sais(s)
+    return SA[1:]
+
+def bwt_sa_is(text):
+    """
+    Calcola la trasformazione di Burrows-Wheeler usando il suffix array ottenuto con SA-IS.
+    Aggiunge il carattere terminatore '$' se non presente.
+    """
+    if "$" not in text:
+        text += "$"
+    SA = suffix_array_sa_is(text)
+    n = len(text)
+    bwt = [text[(i - 1) % n] for i in SA]
+    return "".join(bwt)
+
+# ... existing code ...
+
+def burrows_wheeler_transform(text, block_size=1024*1024):
+    """Applica BWT con gestione memoria efficiente."""
     if len(text) <= block_size:
-        #print("[INFO] Testo più piccolo del block_size, applicazione diretta di BWT...")
-        rotations = sorted([text[i:] + text[:i] for i in range(len(text))])
-        #print("[DEBUG] Matrice delle rotazioni ordinata:")
-        """
-        for row in rotations:
-            #print(f"  {row}")
-        """
-        result = "".join(row[-1] for row in rotations)
-        #print(f"[INFO] Risultato BWT: {result}")
-        return result
+        return bwt_sa_is(text)
     
-    #print(f"[INFO] Applicazione di BWT per blocchi di dimensione {block_size}...")
-    output = []
-    for i in range(0, len(text), block_size):
+    # Process large text in blocks with overlap
+    blocks = []
+    overlap = 100  # Overlap size to maintain context
+    for i in range(0, len(text), block_size-overlap):
         block = text[i:i+block_size]
-        #print(f"[DEBUG] Elaborazione blocco {i // block_size + 1}: {block}")
-        rotations = sorted([block[j:] + block[:j] for j in range(len(block))])
-        #print("[DEBUG] Matrice delle rotazioni per il blocco:")
-        """
-        for row in rotations:
-            #print(f"  {row}")
-        """
-        transformed_block = "".join(row[-1] for row in rotations)
-        #print(f"[INFO] BWT del blocco: {transformed_block}")
-        output.append(transformed_block)
-    
-    final_result = "".join(output)
-    #print(f"[INFO] Risultato finale BWT: {final_result}")
-    return final_result    
-def inverse_burrows_wheeler(bwt_string):
-    """Ricostruisce la stringa originale dalla trasformata di Burrows-Wheeler."""
-    table = ["" for _ in bwt_string]
-    for _ in range(len(bwt_string)):
-        table = sorted([bwt_string[i] + table[i] for i in range(len(bwt_string))])
-    for row in table:
-        if row.endswith("$"):
-            return row[:-1]
+        if block:
+            transformed = bwt_sa_is(block)
+            blocks.append(transformed)
+            print(f"BWT Progress: {(i+len(block))*100/len(text):.2f}%")
+    return "".join(blocks)
 
-def parallel_mtf(text, block_size=1024):
-    """Esegue Move-To-Front Transform in parallelo su blocchi."""
+def parallel_bwt(text):
+    """Applica BWT senza parallelizzazione."""
+    print("Starting BWT transformation...")
+    return burrows_wheeler_transform(text)
+
+# ... rest of the code ...
+def inverse_burrows_wheeler(bwt_string):
+    """Versione ottimizzata dell'inversione BWT."""
+    if not bwt_string:
+        return ""
+        
+    # Create first/last column mapping
+    n = len(bwt_string)
+    first_col = sorted(enumerate(bwt_string), key=lambda x: x[1])
+    next_pos = [0] * n
+    
+    for i, (orig_pos, _) in enumerate(first_col):
+        next_pos[orig_pos] = i
+        
+    result = []
+    pos = next_pos[bwt_string.index('$')]
+    for _ in range(n - 1):
+        result.append(bwt_string[pos])
+        pos = next_pos[pos]
+        
+    return ''.join(reversed(result))
+
+# ============================
+# FUNZIONI DI MOVE-TO-FRONT (MTF)
+# ============================
+def parallel_mtf(text, block_size=4096):
+    """Move-To-Front Transform parallelo ottimizzato."""
     blocks = [text[i:i+block_size] for i in range(0, len(text), block_size)]
-    
     with multiprocessing.Pool() as pool:
-        results = pool.map(move_to_front_transform, blocks)  # Esegue MTF in parallelo
-    
-    return [item for sublist in results for item in sublist]  # Unisce i risultati
+        results = pool.map(move_to_front_transform, blocks)
+    return [item for sublist in results for item in sublist]
 
 def move_to_front_transform(text):
     """Applica Move-To-Front Transform (MTF) su una stringa."""
-    #print("\n[INFO] Eseguendo Move-To-Front Transform (MTF)...")
-    alphabet = sorted(set(text))  # Costruisce la lista ordinata dei caratteri unici
-    #print("alfabeto",alphabet)
+    alphabet = sorted(set(text))
     encoded = []
-    #print("Alfabeto iniziale",alphabet," basata su " + text)
     for char in text:
         index = alphabet.index(char)
         encoded.append(index)
-        alphabet.insert(0, alphabet.pop(index))  # Sposta il carattere all'inizio della lista
-        #print(f"    - Carattere: {char}, Indice: {index}, Lista aggiornata: {alphabet}")
+        alphabet.insert(0, alphabet.pop(index))
     return encoded
-def move_to_front_decoding(encoded,text):
-    """Applica Move-To-Front Decoding (MTF)."""
-    # Ricostruire l'alfabeto iniziale basato sui caratteri possibili
-    #print("testo",text)
-    alphabet = sorted(set(text))  # Deve corrispondere a quello della codifica
-    #print(alphabet)
+
+def move_to_front_decoding(encoded, text):
+    """Decodifica la sequenza MTF usando l'alfabeto iniziale."""
+    alphabet = sorted(set(text))
     decoded = []
-    
     for index in encoded:
-        symbol = alphabet[index]  # Trova il simbolo in base all'indice
-        decoded.append(symbol)  # Aggiungi il simbolo alla sequenza decodificata
-        alphabet.pop(index)  # Rimuovi il simbolo dall'alfabeto
-        alphabet.insert(0, symbol)  # Sposta il simbolo in cima alla lista
-    
-    return "".join(decoded)  # Ricostruisce la stringa originale
+        symbol = alphabet[index]
+        decoded.append(symbol)
+        alphabet.pop(index)
+        alphabet.insert(0, symbol)
+    return "".join(decoded)
 
-
+# ============================
+# FUNZIONI DI J-BIT ENCODING/DECODING
+# ============================
 def jbit_encoding(data):
-    """Applica J-bit Encoding (JBE) separando dati e mappa di bit secondo il paper."""
-    #print("\n[INFO] Eseguendo J-bit Encoding (JBE)...")
-    data_I = []  # Byte diversi da zero
-    data_II = []  # Mappa di bit
-    temp_byte = 0  # Temporary byte per raccogliere bit
-    bit_count = 0  # Contatore di bit nel temporary byte
+    """Applica J-bit Encoding separando i dati e la mappa dei bit."""
+    data_I = []  # Valori non zero
+    data_II = []  # Mappa dei bit
+    temp_byte = 0
+    bit_count = 0
     count = 0
     for value in data:
         if value != 0:
             data_I.append(value)
-            temp_byte = (temp_byte << 1) | 1  # Aggiungere un '1' a data_II
-            count +=1
+            temp_byte = (temp_byte << 1) | 1
+            count += 1
         else:
-            temp_byte = (temp_byte << 1) | 0  # Aggiungere uno '0'
-            count +=1
+            temp_byte = (temp_byte << 1) | 0
+            count += 1
         bit_count += 1
-        #print(f"    - Valore: {value}, Temporary Byte: {bin(temp_byte)}, Bit Count: {bit_count}")
-        
-        if bit_count == 8:  # Quando il temporary byte è pieno, salvarlo in data_II
-            #print("temp",temp_byte)
+        if bit_count == 8:
             data_II.append(temp_byte)
             temp_byte = 0
             bit_count = 0
-    
-    if bit_count > 0:  # Se rimangono bit non scritti, riempiamo fino a 8 bit
-        temp_byte <<= (8 - bit_count)  # Aggiungiamo zeri nei bit finali
+    if bit_count > 0:
+        temp_byte <<= (8 - bit_count)
         data_II.append(temp_byte)
-    
-    #print("    - Dati I (Valori utili):", data_I)
-    #print("    - Dati II (Mappa bit in binario):", [bin(x) for x in data_II])
-    #print("    - Dati II (Mappa bit in binario):", " ".join(f"{bin(x)[2:].zfill(8)}" for x in data_II))
-    
-    return data_I, data_II,count
+    return data_I, data_II, count
 
-
-
-
-
-
-    """Applica Run-Length Encoding (RLE) a una stringa."""
-    #print("\n[INFO] Eseguendo Run-Length Encoding (RLE)...")
-    encoded = []
-    i = 0
-    while i < len(data):
-        count = 1
-        while i + 1 < len(data) and data[i] == data[i + 1]:
-            i += 1
-            count += 1
-        encoded.append((data[i], count))
-        #print(f"    - Carattere: {data[i]}, Conteggio: {count}")
-        i += 1
-    return encoded
-
-    """Applica la trasformazione di Burrows-Wheeler (BWT)."""
-    #print("\n[INFO] Eseguendo Burrows-Wheeler Transform (BWT)...")
-    text += "$"  # Aggiungere simbolo di fine stringa
-    rotations = sorted([text[i:] + text[:i] for i in range(len(text))])
-    """
-    for i, row in enumerate(rotations):
-        #print(f"    - Rotazione {i}: {row}")
-    """
-    bwt = "".join(row[-1] for row in rotations)
-    #print("    - Risultato BWT:", bwt)
-    return bwt
 def jbit_decoding(data_I, data_II, original_length):
-    """Applica la decodifica J-bit Encoding (JBE) per ripristinare l'input originale."""
-    #print("qui",data_I,data_II)
+    """Decodifica J-bit Encoding per ripristinare i dati originali."""
     decoded_data = []
-    bit_index = 0  # Indice per leggere `Data I`
-    bit_count = 0  # Numero di bit letti
-    #print(original_length)
-    # Scansioniamo i byte di `Data II` (mappa bit)
+    bit_index = 0
+    bit_count = 0
     for temp_byte in data_II:
-        #print(temp_byte)
-        for i in range(7, -1, -1):  # Leggiamo ogni bit da sinistra a destra
-            if bit_count >= original_length:  # Se abbiamo ricostruito l'input originale, fermiamo il processo
+        for i in range(7, -1, -1):
+            if bit_count >= original_length:
                 return decoded_data
-            #print("cc",temp_byte >> i & 1)
-            if (temp_byte >> i) & 1:  # Se il bit è `1`, prendiamo un valore da `Data I`
-                if bit_index < len(data_I):  # Controllo per evitare errori di accesso
+            if (temp_byte >> i) & 1:
+                if bit_index < len(data_I):
                     decoded_data.append(data_I[bit_index])
                     bit_index += 1
-            else:  # Se il bit è `0`, scriviamo uno zero byte
+            else:
                 decoded_data.append(0)
-            
-            bit_count += 1  # Aggiorniamo il conteggio dei bit usati
-
+            bit_count += 1
     return decoded_data
 
-def parallel_arithmetic_encode(symbols, block_size=1024):
-    """Esegue la codifica aritmetica in parallelo su blocchi."""
-    blocks = [symbols[i:i+block_size] for i in range(0, len(symbols), block_size)]
-    
-    with multiprocessing.Pool() as pool:
-        results = pool.map(arithmetic_encode, blocks)  # Esegue encoding in parallelo
-    
-    # Dividere i risultati nelle tre componenti
-    encoded_values = [res[0] for res in results]
-    ranges_list = [res[1] for res in results]
-    lengths = [res[2] for res in results]
-    
-    return encoded_values, ranges_list, lengths  # Restituisce i tre elementi separatamente
+# ============================
+# FUNZIONI DI CODIFICA ARITMETICA CON RENORMALIZZAZIONE (ARITMETICA INTERA)
+# ============================
 
-
-def arithmetic_encode(symbols):
-    #print("\n[INFO] Eseguendo codifica aritmetica...")
-    
-    # Calcola la frequenza dei simboli
+def arithmetic_encode(symbols, precision=64):
+    """
+    Codifica la sequenza di simboli usando aritmetica intera con rinormalizzazione.
+    Restituisce una tupla: (encoded_value, total_bits, ranges, length, total)
+    """
     freq = Counter(symbols)
     total = sum(freq.values())
-    #print(f"[DEBUG] Frequenze dei simboli: {freq}")
+    cum = {}
+    cumulative = 0
+    for sym in sorted(freq):
+        cum[sym] = (cumulative, cumulative + freq[sym])
+        cumulative += freq[sym]
+    ranges = {sym: (low, high) for sym, (low, high) in cum.items()}
     
-    # Calcola gli intervalli cumulativi
-    low = Decimal(0)
-    high = Decimal(1)
-    ranges = {}
-    current_low = Decimal(0)
+    low = 0
+    high = (1 << precision) - 1
+    HALF = 1 << (precision - 1)
+    QUARTER = 1 << (precision - 2)
+    THREE_QUARTER = 3 * QUARTER
+    underflow = 0
+    output_bits = []
     
-    for symbol, count in sorted(freq.items()):
-        probability = Decimal(count) / Decimal(total)
-        ranges[symbol] = (current_low, current_low + probability)
-        #print(f"[DEBUG] Intervallo per {symbol}: {ranges[symbol]}")
-        current_low += probability
-    
-    # Codifica aritmetica
     for symbol in symbols:
-        low_range, high_range = ranges[symbol]
-        range_width = high - low
-        high = low + range_width * high_range
-        low = low + range_width * low_range
-        #print(f"[DEBUG] Simbolo: {symbol}, Low: {low}, High: {high}")
-    
-    # Il valore codificato può essere qualsiasi valore in (low, high)
-    encoded_value = (low + high) / 2
-    #print(f"[INFO] Valore codificato: {encoded_value}, Lunghezza simboli: {len(symbols)}")
-    return encoded_value, ranges, len(symbols)
-def arithmetic_decode(encoded_value, ranges, length):
-    decoded_symbols = []
-    low = Decimal(0)
-    high = Decimal(1)
-    # 🔥 Converti encoded_value in Fraction
-    encoded_value = Decimal(encoded_value)
-    for _ in range(length):
-        value_range = high - low
-        target_value = (encoded_value - low) / value_range
+        range_width = high - low + 1
+        sym_low, sym_high = cum[symbol]
+        new_low = low + (range_width * sym_low) // total
+        new_high = low + (range_width * sym_high) // total - 1
+        low, high = new_low, new_high
         
-        for symbol, (range_low, range_high) in ranges.items():
-            range_low = Decimal(range_low)  # 🔄 Converti in Fraction
-            range_high = Decimal(range_high)  # 🔄 Converti in Fraction
-            if Decimal(range_low) <= target_value < Decimal(range_high):
-                decoded_symbols.append(symbol)
-                high = low + value_range * Decimal(range_high)
-                low = low + value_range * Decimal(range_low)
+        while True:
+            if high < HALF:
+                output_bits.append(0)
+                for _ in range(underflow):
+                    output_bits.append(1)
+                underflow = 0
+                low = low * 2
+                high = high * 2 + 1
+            elif low >= HALF:
+                output_bits.append(1)
+                for _ in range(underflow):
+                    output_bits.append(0)
+                underflow = 0
+                low = (low - HALF) * 2
+                high = (high - HALF) * 2 + 1
+            elif low >= QUARTER and high < THREE_QUARTER:
+                underflow += 1
+                low = (low - QUARTER) * 2
+                high = (high - QUARTER) * 2 + 1
+            else:
                 break
+
+    underflow += 1
+    if low < QUARTER:
+        output_bits.append(0)
+        for _ in range(underflow):
+            output_bits.append(1)
+    else:
+        output_bits.append(1)
+        for _ in range(underflow):
+            output_bits.append(0)
     
+    encoded_value_int = 0
+    for bit in output_bits:
+        encoded_value_int = (encoded_value_int << 1) | bit
+    total_bits = len(output_bits)
+    
+    return encoded_value_int, total_bits, ranges, len(symbols), total
+
+def arithmetic_decode(encoded_value_int, total_bits, ranges, length, total, precision=64):
+    """
+    Decodifica la codifica aritmetica ottenuta.
+    Restituisce la lista dei simboli originali.
+    """
+    cum = {}
+    for sym, (low_val, high_val) in ranges.items():
+        cum[sym] = (low_val, high_val)
+    
+    low = 0
+    high = (1 << precision) - 1
+    HALF = 1 << (precision - 1)
+    QUARTER = 1 << (precision - 2)
+    THREE_QUARTER = 3 * QUARTER
+
+    bitstream = []
+    for i in range(total_bits):
+        bit = (encoded_value_int >> (total_bits - i - 1)) & 1
+        bitstream.append(bit)
+    bits_iter = iter(bitstream)
+    code = 0
+    for _ in range(precision):
+        try:
+            bit = next(bits_iter)
+        except StopIteration:
+            bit = 0
+        code = (code << 1) | bit
+    
+    decoded_symbols = []
+    for _ in range(length):
+        range_width = high - low + 1
+        value = ((code - low + 1) * total - 1) // range_width
+        for sym in sorted(cum.keys()):
+            sym_low, sym_high = cum[sym]
+            if sym_low <= value < sym_high:
+                decoded_symbols.append(sym)
+                new_low = low + (range_width * sym_low) // total
+                new_high = low + (range_width * sym_high) // total - 1
+                low, high = new_low, new_high
+                break
+
+        while True:
+            if high < HALF:
+                low = low * 2
+                high = high * 2 + 1
+                try:
+                    bit = next(bits_iter)
+                except StopIteration:
+                    bit = 0
+                code = (code * 2 + bit) & ((1 << precision) - 1)
+            elif low >= HALF:
+                low = (low - HALF) * 2
+                high = (high - HALF) * 2 + 1
+                try:
+                    bit = next(bits_iter)
+                except StopIteration:
+                    bit = 0
+                code = (code - HALF) * 2 + bit
+            elif low >= QUARTER and high < THREE_QUARTER:
+                low = (low - QUARTER) * 2
+                high = (high - QUARTER) * 2 + 1
+                try:
+                    bit = next(bits_iter)
+                except StopIteration:
+                    bit = 0
+                code = (code - QUARTER) * 2 + bit
+            else:
+                break
+
     return decoded_symbols
 
+def parallel_arithmetic_encode(symbols, block_size=1024, precision=64):
+    """Esegue codifica aritmetica in parallelo su blocchi."""
+    blocks = [symbols[i:i+block_size] for i in range(0, len(symbols), block_size)]
+    with multiprocessing.Pool() as pool:
+        results = pool.starmap(arithmetic_encode, [(block, precision) for block in blocks])
+    encoded_values = [res[0] for res in results]
+    total_bits_list = [res[1] for res in results]
+    ranges_list = [res[2] for res in results]
+    lengths = [res[3] for res in results]
+    totals = [res[4] for res in results]
+    return encoded_values, total_bits_list, ranges_list, lengths, totals
 
+def parallel_arithmetic_decode(encoded_values, total_bits_list, ranges_list, lengths, totals, precision=64):
+    """Decodifica aritmetica in parallelo per ciascun blocco e restituisce il flusso decodificato."""
+    decoded_blocks = []
+    for ev, tb, r, ln, tot in zip(encoded_values, total_bits_list, ranges_list, lengths, totals):
+        decoded_block = arithmetic_decode(ev, tb, r, ln, tot, precision)
+        decoded_blocks.extend(decoded_block)
+    return decoded_blocks
+
+# ============================
+# SALVATAGGIO E CARICAMENTO FILE COMPRESSI
+# ============================
+def save_compressed_file(filename, original_length, 
+                         encoded_data_I_blocks, encoded_data_II_blocks, alphabet):
+    """
+    Salva i dati compressi in un file binario.
+    Vengono salvati:
+      - Lunghezza originale (numero di bit della mappa J-bit)
+      - L'alfabeto (usato per MTF)
+      - Numero di blocchi per Data I, e per ciascun blocco:
+          * encoded_value (intero convertito in stringa)
+          * total_bits, total, length
+          * Numero di simboli in ranges, e per ciascun simbolo: il byte, low e high
+      - Lo stesso per Data II
+    """
+    with open(filename, "wb") as f:
+        f.write(struct.pack("I", original_length))
+        f.write(struct.pack("I", len(alphabet)))
+        for char in alphabet:
+            f.write(struct.pack("B", ord(char)))
+        
+        num_blocks_I = len(encoded_data_I_blocks)
+        f.write(struct.pack("I", num_blocks_I))
+        for block in encoded_data_I_blocks:
+            encoded_str = str(block.encoded_value)
+            encoded_str_len = len(encoded_str)
+            f.write(struct.pack("I", encoded_str_len))
+            f.write(encoded_str.encode('utf-8'))
+            f.write(struct.pack("I", block.total_bits))
+            f.write(struct.pack("I", block.total))
+            f.write(struct.pack("I", block.length))
+            f.write(struct.pack("I", len(block.ranges)))
+            for symbol, (low_val, high_val) in block.ranges.items():
+                f.write(struct.pack("B", symbol))
+                f.write(f"{low_val}\n".encode('utf-8'))
+                f.write(f"{high_val}\n".encode('utf-8'))
+        
+        num_blocks_II = len(encoded_data_II_blocks)
+        f.write(struct.pack("I", num_blocks_II))
+        for block in encoded_data_II_blocks:
+            encoded_str = str(block.encoded_value)
+            encoded_str_len = len(encoded_str)
+            f.write(struct.pack("I", encoded_str_len))
+            f.write(encoded_str.encode('utf-8'))
+            f.write(struct.pack("I", block.total_bits))
+            f.write(struct.pack("I", block.total))
+            f.write(struct.pack("I", block.length))
+            f.write(struct.pack("I", len(block.ranges)))
+            for symbol, (low_val, high_val) in block.ranges.items():
+                f.write(struct.pack("B", symbol))
+                f.write(f"{low_val}\n".encode('utf-8'))
+                f.write(f"{high_val}\n".encode('utf-8'))
 
 def load_compressed_file(filename):
-    """Carica i dati compressi da un file binario e ricostruisce gli oggetti EncodedData, inclusa la lettura dell'alfabeto iniziale."""
+    """
+    Carica i dati compressi da file binario e ricostruisce:
+      - original_length
+      - alfabeto
+      - lista di blocchi per Data I (lista di EncodedData)
+      - lista di blocchi per Data II (lista di EncodedData)
+    """
     with open(filename, "rb") as f:
-        lenght = struct.unpack("I", f.read(4))[0]
-
-        # 🔹 Legge l'alfabeto iniziale
+        original_length = struct.unpack("I", f.read(4))[0]
         alphabet_size = struct.unpack("I", f.read(4))[0]
         alphabet = "".join(chr(struct.unpack("B", f.read(1))[0]) for _ in range(alphabet_size))
-
-        # 🔥 Legge `encoded_value_I` come stringa e lo converte in Decimal
-        encoded_str_len_I = struct.unpack("I", f.read(4))[0]
-        encoded_value_I = Decimal(f.read(encoded_str_len_I).decode('utf-8'))
-
-        # 🔥 Legge `encoded_value_II` come stringa e lo converte in Decimal
-        encoded_str_len_II = struct.unpack("I", f.read(4))[0]
-        encoded_value_II = Decimal(f.read(encoded_str_len_II).decode('utf-8'))
-
-        # 🔹 Legge la lunghezza dei dati I e II
-        length_I = struct.unpack("I", f.read(4))[0]
-        num_symbols_I = struct.unpack("I", f.read(4))[0]
-        ranges_I = {}
-        for _ in range(num_symbols_I):
-            symbol = struct.unpack("B", f.read(1))[0]
-            low = Decimal(f.readline().decode().strip())  # 🔄 Converti stringa in Decimal
-            high = Decimal(f.readline().decode().strip())  # 🔄 Converti stringa in Decimal
-            ranges_I[symbol] = (low, high)
-
-        encoded_data_I = EncodedData1(encoded_value_I, ranges_I, length_I)
-
-        length_II = struct.unpack("I", f.read(4))[0]
-        num_symbols_II = struct.unpack("I", f.read(4))[0]
-        ranges_II = {}
-        for _ in range(num_symbols_II):
-            symbol = struct.unpack("B", f.read(1))[0]
-            low = Decimal(f.readline().decode().strip())  # 🔄 Converti stringa in Decimal
-            high = Decimal(f.readline().decode().strip())  # 🔄 Converti stringa in Decimal
-            ranges_II[symbol] = (low, high)
-
-        encoded_data_II = EncodedData1(encoded_value_II, ranges_II, length_II)
-
-    return lenght, encoded_data_I, encoded_data_II, alphabet
-
-def save_compressed_file(filename, original_length, encoded_data_I, encoded_data_II, alphabet):
-    """Salva i dati compressi in un file binario, incluso l'alfabeto iniziale per la decodifica MTF."""
-    with open(filename, "wb") as f:
-        f.write(struct.pack("I", original_length))  # Lunghezza originale
         
-        # 🔹 Scrive l'alfabeto iniziale per la decodifica MTF
-        f.write(struct.pack("I", len(alphabet)))  # Numero di caratteri nell'alfabeto
-        for char in alphabet:
-            f.write(struct.pack("B", ord(char)))  # Salva ogni carattere come byte
+        num_blocks_I = struct.unpack("I", f.read(4))[0]
+        encoded_data_I_blocks = []
+        for _ in range(num_blocks_I):
+            encoded_str_len = struct.unpack("I", f.read(4))[0]
+            encoded_value = int(f.read(encoded_str_len).decode('utf-8'))
+            total_bits = struct.unpack("I", f.read(4))[0]
+            total = struct.unpack("I", f.read(4))[0]
+            length = struct.unpack("I", f.read(4))[0]
+            num_symbols = struct.unpack("I", f.read(4))[0]
+            ranges = {}
+            for _ in range(num_symbols):
+                symbol = struct.unpack("B", f.read(1))[0]
+                low_val = int(Decimal(f.readline().decode().strip()))
+                high_val = int(Decimal(f.readline().decode().strip()))
+                ranges[symbol] = (low_val, high_val)
+            encoded_data_I_blocks.append(EncodedData(encoded_value, total_bits, total, ranges, length))
         
-        # 🔥 Salva `encoded_value_I` come stringa UTF-8
-        encoded_str_I = str(encoded_data_I.encoded_value)
-        encoded_str_len_I = len(encoded_str_I)
-        f.write(struct.pack("I", encoded_str_len_I))  # Lunghezza della stringa
-        f.write(encoded_str_I.encode('utf-8'))  # Scrive la stringa stessa
-        
-        # 🔥 Salva `encoded_value_II` come stringa UTF-8
-        encoded_str_II = str(encoded_data_II.encoded_value)
-        encoded_str_len_II = len(encoded_str_II)
-        f.write(struct.pack("I", encoded_str_len_II))
-        f.write(encoded_str_II.encode('utf-8'))
+        num_blocks_II = struct.unpack("I", f.read(4))[0]
+        encoded_data_II_blocks = []
+        for _ in range(num_blocks_II):
+            encoded_str_len = struct.unpack("I", f.read(4))[0]
+            encoded_value = int(f.read(encoded_str_len).decode('utf-8'))
+            total_bits = struct.unpack("I", f.read(4))[0]
+            total = struct.unpack("I", f.read(4))[0]
+            length = struct.unpack("I", f.read(4))[0]
+            num_symbols = struct.unpack("I", f.read(4))[0]
+            ranges = {}
+            for _ in range(num_symbols):
+                symbol = struct.unpack("B", f.read(1))[0]
+                low_val = int(Decimal(f.readline().decode().strip()))
+                high_val = int(Decimal(f.readline().decode().strip()))
+                ranges[symbol] = (low_val, high_val)
+            encoded_data_II_blocks.append(EncodedData(encoded_value, total_bits, total, ranges, length))
+    
+    return original_length, encoded_data_I_blocks, encoded_data_II_blocks, alphabet
 
-        # 🔹 Salva la lunghezza dei dati I e II
-        f.write(struct.pack("I", encoded_data_I.length))
-        f.write(struct.pack("I", len(encoded_data_I.ranges)))  # Numero di simboli in ranges_I
-        for symbol, (low, high) in encoded_data_I.ranges.items():
-            f.write(struct.pack("B", symbol))
-            f.write(f"{low}\n".encode('utf-8'))   # Scrive come stringa per evitare perdita di precisione
-            f.write(f"{high}\n".encode('utf-8'))  # Scrive come stringa per evitare perdita di precisione
-
-        f.write(struct.pack("I", encoded_data_II.length))
-        f.write(struct.pack("I", len(encoded_data_II.ranges)))  # Numero di simboli in ranges_II
-        for symbol, (low, high) in encoded_data_II.ranges.items():
-            f.write(struct.pack("B", symbol))
-            f.write(f"{low}\n".encode('utf-8'))
-            f.write(f"{high}\n".encode('utf-8'))
-
+# ============================
+# FUNZIONI DI COMPRESSIONE E DECOMPRESSIONE
+# ============================
 def compress_file(input_text, output_file):
     """Esegue la compressione completa e salva il file."""
+    print("\n=== COMPRESSION PHASE ===")
+    original_size = len(input_text)
     
+    print(f"Original size: {original_size} bytes")
+    print(f"Original text: {input_text[:100]}..." if len(input_text) > 100 else input_text)
+    print(f"Processing file of size: {len(input_text)} bytes")
+    
+    if len(input_text) > 1024 * 1024 * 100:
+        print("Large file detected, using optimized processing...")
+        gc.collect()
+        
+    # Step 1: Run-Length Encoding
+    start_time = time.time()
     rle_output = run_length_encoding(input_text)
     rle_string = "".join(f"{char}{str(count)}" for char, count in rle_output)
-
-    bwt_output = parallel_bwt(rle_string)
+    rle_time = time.time() - start_time
+    print(f"\n1. Run-Length Encoding:")
+    print(f"Output: {rle_string[:100]}..." if len(rle_string) > 100 else rle_string)
+    print(f"Time: {rle_time:.4f} seconds")
     
-    # 🔹 Creiamo l'alfabeto prima della MTF
+    # Step 2: Burrows-Wheeler Transform (ottimizzato con SA-IS)
+    start_time = time.time()
+    bwt_output = parallel_bwt(rle_string)
+    bwt_time = time.time() - start_time
+    print(f"\n2. Burrows-Wheeler Transform:")
+    print(f"Time: {bwt_time:.4f} seconds")
+    
+    # Step 3: Move-To-Front Transform
     alphabet = sorted(set(bwt_output))
-
+    start_time = time.time()
     mtf_output = parallel_mtf(bwt_output)
+    mtf_time = time.time() - start_time
+    print(f"\n3. Move-To-Front Transform:")
+    print(f"Time: {mtf_time:.4f} seconds")
+    
+    # Step 4: J-bit Encoding
+    start_time = time.time()
+    data_I, data_II, count_bits = jbit_encoding(mtf_output)
+    jbe_time = time.time() - start_time
+    print(f"\n4. J-bit Encoding:")
+    print(f"Time: {jbe_time:.4f} seconds")
+    
+    # Step 5: Arithmetic Encoding
+    start_time = time.time()
+    encoded_values_I, total_bits_list_I, ranges_list_I, lengths_I, totals_I = parallel_arithmetic_encode(data_I)
+    encoded_values_II, total_bits_list_II, ranges_list_II, lengths_II, totals_II = parallel_arithmetic_encode(data_II)
+    arithmetic_time = time.time() - start_time
+    print(f"\n5. Arithmetic Encoding:")
+    print(f"Time: {arithmetic_time:.4f} seconds")
 
-    data_I, data_II, count = jbit_encoding(mtf_output)
-
-    encoded_values_I, ranges_list_I, lengths_I = parallel_arithmetic_encode(data_I)
-    encoded_values_II, ranges_list_II, lengths_II = parallel_arithmetic_encode(data_II)
-
-    # 🔹 Prendiamo solo il primo valore per ogni blocco
-    encoded_data1 = EncodedData1(encoded_values_I[0], ranges_list_I[0], lengths_I[0])
-    encoded_data2 = EncodedData1(encoded_values_II[0], ranges_list_II[0], lengths_II[0])
-
-    save_compressed_file(output_file, count, encoded_data1, encoded_data2, alphabet)
-
+    total_time = rle_time + bwt_time + mtf_time + jbe_time + arithmetic_time
+    print(f"\nTotal compression time: {total_time:.4f} seconds")
+    
+    encoded_data_I_blocks = [EncodedData(ev, tb, tot, r, ln)
+                           for ev, tb, r, ln, tot in zip(encoded_values_I, total_bits_list_I, ranges_list_I, lengths_I, totals_I)]
+    encoded_data_II_blocks = [EncodedData(ev, tb, tot, r, ln)
+                            for ev, tb, r, ln, tot in zip(encoded_values_II, total_bits_list_II, ranges_list_II, lengths_II, totals_II)]
+    
+    save_compressed_file(output_file, count_bits, encoded_data_I_blocks, encoded_data_II_blocks, alphabet)
+    compressed_size = os.path.getsize(output_file)
+    compression_ratio = (compressed_size / original_size) * 100
+    space_saving = 100 - compression_ratio
+    
+    print("\n=== COMPRESSION STATISTICS ===")
+    print(f"Original size: {original_size:,} bytes")
+    print(f"Compressed size: {compressed_size:,} bytes")
+    print(f"Compression ratio: {compression_ratio:.2f}%")
+    print(f"Space saving: {space_saving:.2f}%")
 
 def decompress_file(input_file):
     """Esegue la decompressione dal file salvato e restituisce il testo originale."""
-    #print("[INFO] Avvio decompressione...")
-
-    # Step 1: Carica il file compresso
-    lenght, encoded_I, encoded_II,alphabet = load_compressed_file(input_file)
+    print("\n=== DECOMPRESSION PHASE ===")
+    
+    start_time = time.time()
+    original_length, encoded_data_I_blocks, encoded_data_II_blocks, alphabet = load_compressed_file(input_file)
     alphabet = sorted(set(alphabet))
-    #print(lenght, encoded_I, encoded_II,alphabet)
-    # Step 2: Decodifica Arithmetic Encoding
-    decoded_I = arithmetic_decode(encoded_I.encoded_value, encoded_I.ranges,encoded_I.length)
-    decoded_II = arithmetic_decode(encoded_II.encoded_value, encoded_II.ranges,encoded_II.length)
-    #print("Dal aritmetica otteniamo il decode -> ",decoded_I,decoded_II)
-    # Step 3: J-bit Decoding
-    decoded_mtf = jbit_decoding(decoded_I, decoded_II, lenght)
-    #print("Dato MTF otteniamo la sua decodifica",decoded_mtf)
-    # Step 4: Move-To-Front Decoding
-    decoded_bwt = move_to_front_decoding(decoded_mtf,alphabet)
-    #print("Dio",decoded_bwt)
-    # Step 5: Inverse Burrows-Wheeler Transform
-    #print("qui",decoded_bwt)
+    load_time = time.time() - start_time
+    print(f"\n1. Load Compressed File:")
+    print(f"Time: {load_time:.4f} seconds")
+    
+    start_time = time.time()
+    decoded_I = parallel_arithmetic_decode([block.encoded_value for block in encoded_data_I_blocks],
+                                         [block.total_bits for block in encoded_data_I_blocks],
+                                         [block.ranges for block in encoded_data_I_blocks],
+                                         [block.length for block in encoded_data_I_blocks],
+                                         [block.total for block in encoded_data_I_blocks])
+    decoded_II = parallel_arithmetic_decode([block.encoded_value for block in encoded_data_II_blocks],
+                                          [block.total_bits for block in encoded_data_II_blocks],
+                                          [block.ranges for block in encoded_data_II_blocks],
+                                          [block.length for block in encoded_data_II_blocks],
+                                          [block.total for block in encoded_data_II_blocks])
+    arithmetic_time = time.time() - start_time
+    print(f"\n2. Arithmetic Decoding:")
+    print(f"Time: {arithmetic_time:.4f} seconds")
+    
+    start_time = time.time()
+    decoded_mtf = jbit_decoding(decoded_I, decoded_II, original_length)
+    jbe_time = time.time() - start_time
+    print(f"\n3. J-bit Decoding:")
+    print(f"Time: {jbe_time:.4f} seconds")
+    
+    start_time = time.time()
+    decoded_bwt = move_to_front_decoding(decoded_mtf, alphabet)
+    mtf_time = time.time() - start_time
+    print(f"\n4. Move-To-Front Decoding:")
+    print(f"Time: {mtf_time:.4f} seconds")
+    
+    start_time = time.time()
     rle_string = inverse_burrows_wheeler(decoded_bwt)
-
-    # Step 6: Run-Length Decoding
-    #print(rle_string)
+    bwt_time = time.time() - start_time
+    print(f"\n5. Inverse Burrows-Wheeler Transform:")
+    print(f"Output: {rle_string[:100]}..." if len(rle_string) > 100 else rle_string)
+    print(f"Time: {bwt_time:.4f} seconds")
+    
+    start_time = time.time()
     original_text = run_length_decoding(rle_string)
-
-    #print("[INFO] Decompressione completata.")
-    return original_text or "gay"
+    rle_time = time.time() - start_time
+    print(f"\n6. Run-Length Decoding:")
+    print(f"Final output: {original_text[:100]}..." if len(original_text) > 100 else original_text)
+    print(f"Time: {rle_time:.4f} seconds")
+    
+    total_time = load_time + arithmetic_time + jbe_time + mtf_time + bwt_time + rle_time
+    print(f"\nTotal decompression time: {total_time:.4f} seconds")
+    
+    return original_text
 
 def read_file(filename):
     """
     Legge i dati da un file e restituisce il contenuto come stringa.
-    
-    Args:
-        filename (str): Il percorso del file da leggere.
-        
-    Returns:
-        str: Il contenuto del file come stringa.
     """
     try:
         with open(filename, "r", encoding="utf-8") as file:
             return file.read()
     except FileNotFoundError:
-        #print(f"[ERRORE] Il file '{filename}' non è stato trovato.")
         return None
     except Exception as e:
-        #print(f"[ERRORE] Si è verificato un errore durante la lettura del file: {e}")
         return None
 
-
 # ============================
-# 🚀 ESEMPIO DI UTILIZZO
+# ESEMPIO DI UTILIZZO
 # ============================
 if __name__ == "__main__":
-    
-
-    #print("Directory corrente:", os.getcwd())
-    input_text = read_file("file2.txt")
+    nameFile = sys.argv[1]
+    input_text = read_file(sys.argv[1])
+    if input_text is None:
+        print("Errore: file non trovato.")
+        exit(1)
+    input_size = os.path.getsize(nameFile)
+    print(f"\nInput file size: {input_size:,} bytes")
     compressed_file = "compressed.bin"
-    compress_file(input_text,compressed_file)
-
+    compress_file(input_text, compressed_file)
     decompressed_text = decompress_file(compressed_file)
+    
+    compressed_size = os.path.getsize(compressed_file)
+    print("\n=== FINAL STATISTICS ===")
+    print(f"Original file size: {input_size:,} bytes")
+    print(f"Compressed file size: {compressed_size:,} bytes")
+    print(f"Final compression ratio: {(compressed_size/input_size)*100:.2f}%")
 
-    # Verifica
-    #print("\n[RISULTATO] Testo originale:", input_text)
-    #print("[RISULTATO] Testo decompresso:", decompressed_text)
-
-    """
-    assert input_text == decompressed_text, "Errore! Il testo decompresso non corrisponde all'originale!"
-    print("[✅] Compressione e decompressione riuscite con successo!")
-    """
     if input_text == decompressed_text:
-    # Scrive il testo decompresso in un file
-        with open("output.txt", "w", encoding="utf-8") as output_file:
-            output_file.write("si")
+        print("Successo")
     else:
-        with open("output.txt", "w", encoding="utf-8") as output_file:
-            output_file.write("no")
+        print("Insuccesso")
